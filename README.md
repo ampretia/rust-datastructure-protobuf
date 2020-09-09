@@ -1,0 +1,1 @@
+An example of how to recursively descend a rust datastructure and convert to and from protobufs
