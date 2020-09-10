@@ -1,8 +1,14 @@
+/*
+ * SPDX-License-Identifier: Apache-2.0
+ */
+
 #![allow(dead_code, unused_variables, unused_imports)]
 use fabric_ledger_protos::{common_messages, ledger_messages};
 use protobuf::{parse_from_bytes, Message};
-
-#[derive(Debug, Clone)]
+use std::collections::{hash_map::Entry, HashMap};
+use std::hash::Hash;
+/// The ROLE definition
+#[derive(Debug, Clone, PartialEq,Hash)]
 pub enum ROLE {
     MEMBER,
     PEER,
@@ -10,7 +16,8 @@ pub enum ROLE {
     CLIENT,
 }
 
-#[derive(Debug, Clone)]
+/// The Expressions - either AND, OR, OUTOF  or the actual Principal
+#[derive(Debug, Clone,Hash)]
 pub enum Expression {
     AND(Vec<Expression>),
     OR(Vec<Expression>),
@@ -18,7 +25,47 @@ pub enum Expression {
     Principal(String, ROLE),
 }
 
-#[derive(Debug)]
+// Implement comparision for the vectors without concern of order
+fn iters_equal_anyorder<T: Eq + Hash>(
+    i1: impl Iterator<Item = T>,
+    i2: impl Iterator<Item = T>,
+) -> bool {
+    fn get_lookup<T: Eq + Hash>(iter: impl Iterator<Item = T>) -> HashMap<T, usize> {
+        let mut lookup = HashMap::<T, usize>::new();
+        for value in iter {
+            match lookup.entry(value) {
+                Entry::Occupied(entry) => {
+                    *entry.into_mut() += 1;
+                }
+                Entry::Vacant(entry) => {
+                    entry.insert(0);
+                }
+            }
+        }
+        lookup
+    }
+    get_lookup(i1) == get_lookup(i2)
+}
+
+impl PartialEq for Expression {
+
+    fn eq(&self, other: &Self) -> bool {
+        use Expression::*;
+        match (self, other) {
+            (AND(e1), AND(e2)) => iters_equal_anyorder(e1.into_iter(), e2.into_iter()),
+            (OR(e1), OR(e2)) => iters_equal_anyorder(e1.into_iter(), e2.into_iter()),
+            (OUTOF(e1, i1), OUTOF(e2, i2)) => {
+                iters_equal_anyorder(e1.into_iter(), e2.into_iter()) && i1 == i2
+            }
+            (Principal(s1, r1), Principal(s2, r2)) => s1 == s2 && r1 == r2,
+            _ => false,
+        }
+    }
+}
+impl Eq for Expression {}
+
+/// Struct to represent the Overal Endorsement
+#[derive(Debug, PartialEq)]
 pub struct StateBasedEndorsement {
     root: Expression,
 }
@@ -28,43 +75,51 @@ impl StateBasedEndorsement {
         StateBasedEndorsement { root: expr }
     }
 }
+// Added this to make the code less cumbersome
 use Expression::*;
-fn main() {
-    println!("Hello");
 
+fn main() {
+    println!("Endorsment Data Structure test");
+
+    let p1 = Principal("ORG1".to_string(), ROLE::PEER);
+    test_sbe(StateBasedEndorsement::build(p1));
+    
     let p1 = Principal("ORG1".to_string(), ROLE::PEER);
     let p2 = Principal("ORG2".to_string(), ROLE::PEER);
     let p3 = Principal("ORG3".to_string(), ROLE::PEER);
-
-    //let sbe = StateBasedEndorsement::build(p1);
-    // println!("Rust Structure.... {:#?}", sbe);
+    test_sbe( StateBasedEndorsement::build(OUTOF(vec![p1, p2,p3],2))  );
+    
+    let p1 = Principal("ORG1".to_string(), ROLE::PEER);
+    let p3 = Principal("ORG3".to_string(), ROLE::PEER);
+    let p4 = Principal("ORG4".to_string(), ROLE::PEER);
+    test_sbe( StateBasedEndorsement::build(AND(vec![p1, OR(vec![p3, p4])])));
 
     let p1 = Principal("ORG1".to_string(), ROLE::PEER);
     let p2 = Principal("ORG2".to_string(), ROLE::PEER);
     let p3 = Principal("ORG3".to_string(), ROLE::PEER);
     let p4 = Principal("ORG4".to_string(), ROLE::PEER);
-    let sbe = StateBasedEndorsement::build(AND(vec![p1, OR(vec![p3, p4])]));
+    test_sbe( StateBasedEndorsement::build(AND(vec![OR(vec![p1, p2]), OR(vec![p3, p4])])) );
+}
 
-    //let sbe = StateBasedEndorsement::build(AND(vec![OR(vec![p1, p2]), OR(vec![p3, p4])]));
-    //let sbe = StateBasedEndorsement::build(AND(vec![p1, p2]));
-    println!("Rust Structure....  {:#?}", sbe);
+// Helper function to test the SBE by writing to a protobuf and then back agaibn
+fn test_sbe(sbe1: StateBasedEndorsement) {
+    println!("Incoming.... {:?}", sbe1);
 
     let mut ep = ledger_messages::EndorsementPolicy::new();
     let mut r = ledger_messages::EndorsementRule::new();
-    match_expr(&sbe.root, &mut r);
+    match_expr(&sbe1.root, &mut r);
     ep.set_rule(r);
 
     // create the buffer to send
     let buffer = ep.write_to_bytes().unwrap();
     let ep = parse_from_bytes::<ledger_messages::EndorsementPolicy>(&buffer).unwrap();
-    let e = match read_policy(&ep.get_rule()) {
-        OUTOF(e, 0) => e[0].clone(),
-        _ => unreachable!(),
-    };
-    let sbe = StateBasedEndorsement::build(e);
-    println!("Rust Structure.... {:#?}", sbe);
+    let e = read_policy(&ep.get_rule());
+    let sbe2 = StateBasedEndorsement::build(e);
+    println!("Reparsed.... {:?}",sbe2);
+    assert_eq!(sbe1, sbe2);
 }
 
+/// Function to read the protobuf format and return the Rust Enum
 fn read_policy(r: &ledger_messages::EndorsementRule) -> Expression {
     let min = r.get_min_endorsements();
     let rules = r.get_rules();
@@ -98,7 +153,7 @@ fn read_policy(r: &ledger_messages::EndorsementRule) -> Expression {
 
     let num_elements = (vec_principals.len() + vec_rules.len()) as i32;
 
-    if (vec_principals.len() == 1 && vec_rules.len() == 0) {
+    if vec_principals.len() == 1 && vec_rules.len() == 0 {
         return vec_principals[0].clone();
     } else if min == 1 {
         let concatenated = [&vec_rules[..], &vec_principals[..]].concat();
@@ -108,10 +163,16 @@ fn read_policy(r: &ledger_messages::EndorsementRule) -> Expression {
         return Expression::AND(concatenated);
     } else {
         let concatenated = [&vec_rules[..], &vec_principals[..]].concat();
-        return Expression::OUTOF(concatenated, min as usize);
+        if min==0 {
+            return concatenated[0].clone();
+        } else {
+            return Expression::OUTOF(concatenated, min as usize);
+        };
+        
     };
 }
 
+/// Fn to read the Rust enum and produce the protobuf
 fn match_expr(expr: &Expression, rule: &mut ledger_messages::EndorsementRule) {
     match expr {
         AND(e) => {
@@ -122,7 +183,7 @@ fn match_expr(expr: &Expression, rule: &mut ledger_messages::EndorsementRule) {
                 match_expr(subexpre, &mut r);
             }
             let min_endoresemtns: usize = r.get_principals().len() + r.get_rules().len();
-            r.set_min_endorsements(min_endoresemtns as i32); // OR so it is set to 1
+            r.set_min_endorsements(min_endoresemtns as i32);
 
             rule.mut_rules().push(r);
         }
